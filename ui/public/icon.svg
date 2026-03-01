@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" ry="96" fill="#1976d2"/>
+  <text x="256" y="260" font-family="system-ui, -apple-system, sans-serif" font-size="140" font-weight="700" fill="white" text-anchor="middle">CO<tspan font-size="100" baseline-shift="sub">2</tspan></text>
+  <!-- Gauge track: semicircle -->
+  <path d="M 156 340 A 100 100 0 0 1 356 340" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="14" stroke-linecap="round"/>
+  <!-- Gauge indicator: filled arc (mid-high reading, ~70%) -->
+  <path d="M 156 340 A 100 100 0 0 1 315 259" fill="none" stroke="white" stroke-width="14" stroke-linecap="round"/>
+</svg>
