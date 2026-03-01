@@ -21,10 +21,10 @@
 #define CRC8_POLYNOMIAL 0x31
 #define CRC8_INIT 0xFF
 
-#define ESS_SERVICE_UUID "181A"
-#define CO2_CHAR_UUID "2B8C"
-#define TEMP_CHAR_UUID "2A6E"
-#define HUM_CHAR_UUID "2A6F"
+#define ESS_SERVICE_UUID "0000181a-0000-1000-8000-00805f9b34fb"
+#define CO2_CHAR_UUID "00002b8c-0000-1000-8000-00805f9b34fb"
+#define TEMP_CHAR_UUID "00002a6e-0000-1000-8000-00805f9b34fb"
+#define HUM_CHAR_UUID "00002a6f-0000-1000-8000-00805f9b34fb"
 #define AGE_CHAR_UUID "b5a2e7f0-3c4d-4f5e-8a1b-9c0d1e2f3a4b"
 #define DEVICE_NAME "CO2 Sensor"
 #define READ_INTERVAL 10000
@@ -42,6 +42,33 @@ class AgeReadCallback : public BLECharacteristicCallbacks
   {
     uint32_t age = (uint32_t)(millis() - lastReadMillis);
     pChar->setValue(age);
+  }
+};
+
+class ServerCallbacks : public BLEServerCallbacks
+{
+  void onConnect(BLEServer *pServer, esp_ble_gatts_cb_param_t *param) override
+  {
+    Serial.print("[BLE] Client connected: ");
+    if (param && param->connect.remote_bda)
+    {
+      for (int i = 0; i < 6; i++)
+      {
+        if (i > 0)
+          Serial.print(":");
+        Serial.printf("%02x", param->connect.remote_bda[i]);
+      }
+      Serial.println();
+    }
+    else
+    {
+      Serial.println("(no param)");
+    }
+  }
+  void onDisconnect(BLEServer *pServer) override
+  {
+    Serial.println("[BLE] Client disconnected — restarting advertising");
+    BLEDevice::startAdvertising();
   }
 };
 
@@ -86,8 +113,10 @@ void setup()
 {
   Serial.begin(115200);
   delay(2000);
-  Wire.begin(SDA, SCL);
+  Serial.println("[BOOT] Starting CO2 Sensor firmware");
 
+  Wire.begin(SDA, SCL);
+  Serial.println("[I2C] Bus initialised on SDA=21 SCL=22");
   delay(1000);
 
   // Start periodic measurement (SCD4x 0x21 0xb1)
@@ -97,28 +126,38 @@ void setup()
   uint8_t err = Wire.endTransmission();
   if (err != 0)
   {
-    Serial.print("Sensor not found (I2C error ");
+    Serial.print("[I2C] Sensor not found (I2C error ");
     Serial.print(err);
     Serial.println(")");
   }
   else
   {
-    Serial.println("Setup wire");
+    Serial.println("[I2C] Setup wire — periodic measurement started");
   }
   delay(5000);
 
   BLEDevice::init(DEVICE_NAME);
+  Serial.println("[BLE] Device name set: CO2 Sensor");
+
   BLEServer *pServer = BLEDevice::createServer();
+  Serial.println("[BLE] Server created");
+  pServer->setCallbacks(new ServerCallbacks());
+
   BLEService *pService = pServer->createService(ESS_SERVICE_UUID);
+  Serial.println("[BLE] Service created: " ESS_SERVICE_UUID);
 
   pCo2Char = pService->createCharacteristic(CO2_CHAR_UUID,
                                             BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  Serial.println("[BLE] Characteristic created: CO2 " CO2_CHAR_UUID " (READ|NOTIFY)");
   pTempChar = pService->createCharacteristic(TEMP_CHAR_UUID,
                                              BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  Serial.println("[BLE] Characteristic created: Temp " TEMP_CHAR_UUID " (READ|NOTIFY)");
   pHumChar = pService->createCharacteristic(HUM_CHAR_UUID,
                                             BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  Serial.println("[BLE] Characteristic created: Hum " HUM_CHAR_UUID " (READ|NOTIFY)");
   pAgeChar = pService->createCharacteristic(AGE_CHAR_UUID,
                                             BLECharacteristic::PROPERTY_READ);
+  Serial.println("[BLE] Characteristic created: Age " AGE_CHAR_UUID " (READ)");
 
   pCo2Char->addDescriptor(new BLE2902());
   pTempChar->addDescriptor(new BLE2902());
@@ -127,28 +166,44 @@ void setup()
   pAgeChar->setCallbacks(new AgeReadCallback());
 
   pService->start();
+  Serial.println("[BLE] Service started");
 
   BLEAdvertising *pAdv = BLEDevice::getAdvertising();
   pAdv->addServiceUUID(ESS_SERVICE_UUID);
   pAdv->setScanResponse(true);
   BLEDevice::startAdvertising();
+  Serial.println("[BLE] Advertising started — ready for connections");
 }
 
 void loop()
 {
-  if (lastReadMillis != 0 && (millis() - lastReadMillis) < READ_INTERVAL)
-    return;
+  if (lastReadMillis != 0)
+  {
+    unsigned long elapsed = millis() - lastReadMillis;
+    if (elapsed < READ_INTERVAL)
+    {
+      static unsigned long lastLog = 0;
+      if (millis() - lastLog >= 1000)
+      {
+        Serial.printf("[LOOP] Waiting... %lums until next read\n", READ_INTERVAL - elapsed);
+        lastLog = millis();
+      }
+      return;
+    }
+  }
 
   bool validRead = false;
   byte buffer[MEASUREMENT_BYTES];
   size_t received = Wire.requestFrom((uint8_t)SENSOR_I2C_ADDR, (size_t)sizeof(buffer));
+
+  Serial.printf("[I2C] requestFrom: received=%u expected=%u\n", (unsigned)received, (unsigned)sizeof(buffer));
 
   if (received != sizeof(buffer))
   {
     co2 = 0;
     temperature = 0;
     humidity = 0;
-    Serial.println("I2C read failed (wrong byte count)");
+    Serial.println("[I2C] Read failed (wrong byte count)");
   }
   else
   {
@@ -168,12 +223,25 @@ void loop()
       float hum = (((float)buffer[6] * 256.0f + (float)buffer[7]) / SCD4X_RAW_SCALE) * SCD4X_HUM_SCALE;
       humidity = (uint16_t)(hum * 100.0f);
       validRead = true;
+      Serial.printf("[I2C] Valid read — raw co2=%u temp_raw=%u hum_raw=%u -> co2=%u temp=%u hum=%u\n",
+                    (unsigned)(buffer[0] * 256 + buffer[1]),
+                    (unsigned)(buffer[3] * 256 + buffer[4]),
+                    (unsigned)(buffer[6] * 256 + buffer[7]),
+                    (unsigned)co2, (unsigned)temperature, (unsigned)humidity);
     }
     else
     {
       co2 = 0;
       temperature = 0;
       humidity = 0;
+      Serial.print("[I2C] CRC failed — raw bytes: ");
+      for (size_t i = 0; i < sizeof(buffer); i++)
+      {
+        Serial.printf("%02x", buffer[i]);
+        if (i < sizeof(buffer) - 1)
+          Serial.print(" ");
+      }
+      Serial.println();
     }
   }
 
@@ -186,18 +254,19 @@ void loop()
     pCo2Char->notify();
     pTempChar->notify();
     pHumChar->notify();
+    Serial.println("[BLE] Notifications sent for CO2/Temp/Hum");
   }
 
-  Serial.print("CO2: ");
+  Serial.print("[SENSOR] CO2: ");
   Serial.println(co2);
 
   float ftemp = (float)temperature / 100.0f;
-  Serial.print("Temperature: ");
+  Serial.print("[SENSOR] Temperature: ");
   Serial.println(String(ftemp, 1));
 
   float fhum = (float)humidity / 100.0f;
-  Serial.print("Humidity: ");
+  Serial.print("[SENSOR] Humidity: ");
   Serial.println(String(fhum, 0));
 
-  Serial.println("Waiting 10s before the next round...");
+  Serial.println("[LOOP] Waiting 10s before the next round...");
 }
