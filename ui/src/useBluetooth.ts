@@ -22,7 +22,9 @@ const uuidMatch = (eventUuid: string, fullUuid: string): boolean => {
   }
   return false
 }
+
 const AGE_POLL_MS = 2000
+const STORED_DEVICE_ID_KEY = 'ble_device_id'
 
 const valueToHex = (value: DataView): string =>
   Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength))
@@ -56,6 +58,7 @@ export function useBluetooth(): {
   errorMessage: string | null
   data: BleData
   connect: () => Promise<void>
+  autoConnect: () => Promise<boolean>
   disconnect: () => void
 } {
   const [status, setStatus] = useState<BleStatus>('idle')
@@ -78,6 +81,114 @@ export function useBluetooth(): {
     setData(initialData)
     setErrorMessage(null)
   }, [])
+
+  // Shared logic: subscribe to notifications and poll age on an already-connected GATT server.
+  const subscribeToDevice = useCallback(
+    async (device: BluetoothDevice, server: BluetoothRemoteGATTServer): Promise<void> => {
+      console.log('[BLE] Getting primary service:', ESS_SERVICE_UUID)
+      let service: BluetoothRemoteGATTService
+      try {
+        service = await server.getPrimaryService(ESS_SERVICE_UUID)
+        console.log('[BLE] ESS service found')
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to get service'
+        console.log('[BLE] Failed to get ESS service:', err)
+        setStatus('error')
+        setErrorMessage(message)
+        server.disconnect()
+        return
+      }
+
+      let co2Char: BluetoothRemoteGATTCharacteristic
+      let tempChar: BluetoothRemoteGATTCharacteristic
+      let humChar: BluetoothRemoteGATTCharacteristic
+      let ageChar: BluetoothRemoteGATTCharacteristic
+      try {
+        console.log('[BLE] Getting characteristic:', CO2_CHAR_UUID)
+        co2Char = await service.getCharacteristic(CO2_CHAR_UUID)
+        console.log('[BLE] Characteristic found:', CO2_CHAR_UUID)
+        console.log('[BLE] Getting characteristic:', TEMP_CHAR_UUID)
+        tempChar = await service.getCharacteristic(TEMP_CHAR_UUID)
+        console.log('[BLE] Characteristic found:', TEMP_CHAR_UUID)
+        console.log('[BLE] Getting characteristic:', HUM_CHAR_UUID)
+        humChar = await service.getCharacteristic(HUM_CHAR_UUID)
+        console.log('[BLE] Characteristic found:', HUM_CHAR_UUID)
+        console.log('[BLE] Getting characteristic:', AGE_CHAR_UUID)
+        ageChar = await service.getCharacteristic(AGE_CHAR_UUID)
+        console.log('[BLE] Characteristic found:', AGE_CHAR_UUID)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to get characteristics'
+        console.log('[BLE] Failed to get characteristic:', err)
+        setStatus('error')
+        setErrorMessage(message)
+        server.disconnect()
+        return
+      }
+
+      const decodeAge = (value: DataView): number => value.getUint32(0, true)
+
+      const readAge = async () => {
+        try {
+          const value = await ageChar.readValue()
+          const age = decodeAge(value)
+          console.log('[BLE] Age read:', age, 'ms')
+          setData((prev) => ({ ...prev, age }))
+        } catch (err) {
+          console.log('[BLE] Age read failed:', err)
+          // ignore read errors (e.g. device disconnected)
+        }
+      }
+
+      const onCharacteristicChanged = (event: Event) => {
+        const char = event.target as BluetoothRemoteGATTCharacteristic
+        const value = char.value!
+        const uuid = char.uuid
+        const rawHex = valueToHex(value)
+        console.log('[BLE] Notification — uuid=', uuid, 'raw=', rawHex)
+
+        if (uuidMatch(uuid, CO2_CHAR_UUID)) {
+          const decoded = value.getUint16(0, true)
+          console.log('[BLE] Notification received — uuid=', uuid, 'raw=', rawHex, 'decoded co2=', decoded)
+          setData((prev) => ({ ...prev, co2: decoded }))
+        } else if (uuidMatch(uuid, TEMP_CHAR_UUID)) {
+          const decoded = value.getUint16(0, true) / 100
+          console.log('[BLE] Notification received — uuid=', uuid, 'raw=', rawHex, 'decoded temperature=', decoded)
+          setData((prev) => ({ ...prev, temperature: decoded }))
+        } else if (uuidMatch(uuid, HUM_CHAR_UUID)) {
+          const decoded = value.getUint16(0, true) / 100
+          console.log('[BLE] Notification received — uuid=', uuid, 'raw=', rawHex, 'decoded humidity=', decoded)
+          setData((prev) => ({ ...prev, humidity: decoded }))
+        }
+      }
+
+      try {
+        console.log('[BLE] Starting notifications for CO2, Temp, Hum')
+        await co2Char.startNotifications()
+        await tempChar.startNotifications()
+        await humChar.startNotifications()
+        console.log('[BLE] Notifications started')
+        co2Char.addEventListener('characteristicvaluechanged', onCharacteristicChanged)
+        tempChar.addEventListener('characteristicvaluechanged', onCharacteristicChanged)
+        humChar.addEventListener('characteristicvaluechanged', onCharacteristicChanged)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to start notifications'
+        console.log('[BLE] Failed to start notifications:', err)
+        setStatus('error')
+        setErrorMessage(message)
+        server.disconnect()
+        return
+      }
+
+      localStorage.setItem(STORED_DEVICE_ID_KEY, device.id)
+      console.log('[BLE] Stored device id:', device.id)
+
+      await readAge()
+      ageIntervalRef.current = setInterval(readAge, AGE_POLL_MS)
+      setStatus('connected')
+      console.log('[BLE] Fully connected and listening')
+    },
+    [],
+  )
 
   const connect = useCallback(async () => {
     console.log('[BLE] connect() called')
@@ -109,7 +220,71 @@ export function useBluetooth(): {
 
     setStatus('connecting')
     deviceRef.current = device
+
+    const cleanup = () => {
+      console.log('[BLE] gattserverdisconnected event fired')
+      if (ageIntervalRef.current) {
+        clearInterval(ageIntervalRef.current)
+        ageIntervalRef.current = null
+      }
+      deviceRef.current = null
+      setStatus('disconnected')
+      setData(initialData)
+      setErrorMessage(null)
+    }
+
+    device.addEventListener('gattserverdisconnected', cleanup)
+
     console.log('[BLE] Connecting to GATT server...')
+    let server: BluetoothRemoteGATTServer
+    try {
+      server = await device.gatt!.connect()
+      console.log('[BLE] GATT server connected')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to connect to device'
+      console.log('[BLE] GATT connect failed:', err)
+      setStatus('error')
+      setErrorMessage(message)
+      return
+    }
+
+    await subscribeToDevice(device, server)
+  }, [subscribeToDevice])
+
+  // Attempts to reconnect to the previously used device without a user gesture.
+  // Returns true if reconnection succeeded, false if the device was not found or
+  // the connection failed (e.g. device is off / out of range).
+  const autoConnect = useCallback(async (): Promise<boolean> => {
+    if (!navigator.bluetooth) return false
+
+    if (typeof navigator.bluetooth.getDevices !== 'function') {
+      console.log('[BLE] autoConnect: getDevices() not supported in this browser (requires Chrome 125+)')
+      return false
+    }
+
+    const storedId = localStorage.getItem(STORED_DEVICE_ID_KEY)
+    if (!storedId) {
+      console.log('[BLE] autoConnect: no stored device id')
+      return false
+    }
+
+    let permitted: BluetoothDevice[]
+    try {
+      permitted = await navigator.bluetooth.getDevices()
+    } catch (err) {
+      console.log('[BLE] autoConnect: getDevices() failed:', err)
+      return false
+    }
+
+    const device = permitted.find((d) => d.id === storedId)
+    if (!device) {
+      console.log('[BLE] autoConnect: stored device not in permitted list')
+      return false
+    }
+
+    console.log('[BLE] autoConnect: found stored device', device.name ?? '(no name)', '— connecting...')
+    setStatus('connecting')
+    deviceRef.current = device
 
     const cleanup = () => {
       console.log('[BLE] gattserverdisconnected event fired')
@@ -128,114 +303,17 @@ export function useBluetooth(): {
     let server: BluetoothRemoteGATTServer
     try {
       server = await device.gatt!.connect()
-      console.log('[BLE] GATT server connected')
+      console.log('[BLE] autoConnect: GATT server connected')
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to connect to device'
-      console.log('[BLE] GATT connect failed:', err)
-      setStatus('error')
-      setErrorMessage(message)
-      return
+      console.log('[BLE] autoConnect: GATT connect failed (device likely out of range):', err)
+      deviceRef.current = null
+      setStatus('idle')
+      return false
     }
 
-    console.log('[BLE] Getting primary service:', ESS_SERVICE_UUID)
-    let service: BluetoothRemoteGATTService
-    try {
-      service = await server.getPrimaryService(ESS_SERVICE_UUID)
-      console.log('[BLE] ESS service found')
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to get service'
-      console.log('[BLE] Failed to get ESS service:', err)
-      setStatus('error')
-      setErrorMessage(message)
-      server.disconnect()
-      return
-    }
+    await subscribeToDevice(device, server)
+    return true
+  }, [subscribeToDevice])
 
-    let co2Char: BluetoothRemoteGATTCharacteristic
-    let tempChar: BluetoothRemoteGATTCharacteristic
-    let humChar: BluetoothRemoteGATTCharacteristic
-    let ageChar: BluetoothRemoteGATTCharacteristic
-    try {
-      console.log('[BLE] Getting characteristic:', CO2_CHAR_UUID)
-      co2Char = await service.getCharacteristic(CO2_CHAR_UUID)
-      console.log('[BLE] Characteristic found:', CO2_CHAR_UUID)
-      console.log('[BLE] Getting characteristic:', TEMP_CHAR_UUID)
-      tempChar = await service.getCharacteristic(TEMP_CHAR_UUID)
-      console.log('[BLE] Characteristic found:', TEMP_CHAR_UUID)
-      console.log('[BLE] Getting characteristic:', HUM_CHAR_UUID)
-      humChar = await service.getCharacteristic(HUM_CHAR_UUID)
-      console.log('[BLE] Characteristic found:', HUM_CHAR_UUID)
-      console.log('[BLE] Getting characteristic:', AGE_CHAR_UUID)
-      ageChar = await service.getCharacteristic(AGE_CHAR_UUID)
-      console.log('[BLE] Characteristic found:', AGE_CHAR_UUID)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to get characteristics'
-      console.log('[BLE] Failed to get characteristic:', err)
-      setStatus('error')
-      setErrorMessage(message)
-      server.disconnect()
-      return
-    }
-
-    const decodeAge = (value: DataView): number => value.getUint32(0, true)
-
-    const readAge = async () => {
-      try {
-        const value = await ageChar.readValue()
-        const age = decodeAge(value)
-        console.log('[BLE] Age read:', age, 'ms')
-        setData((prev) => ({ ...prev, age }))
-      } catch (err) {
-        console.log('[BLE] Age read failed:', err)
-        // ignore read errors (e.g. device disconnected)
-      }
-    }
-
-    const onCharacteristicChanged = (event: Event) => {
-      const char = event.target as BluetoothRemoteGATTCharacteristic
-      const value = char.value!
-      const uuid = char.uuid
-      const rawHex = valueToHex(value)
-      console.log('[BLE] Notification — uuid=', uuid, 'raw=', rawHex)
-
-      if (uuidMatch(uuid, CO2_CHAR_UUID)) {
-        const decoded = value.getUint16(0, true)
-        console.log('[BLE] Notification received — uuid=', uuid, 'raw=', rawHex, 'decoded co2=', decoded)
-        setData((prev) => ({ ...prev, co2: decoded }))
-      } else if (uuidMatch(uuid, TEMP_CHAR_UUID)) {
-        const decoded = value.getUint16(0, true) / 100
-        console.log('[BLE] Notification received — uuid=', uuid, 'raw=', rawHex, 'decoded temperature=', decoded)
-        setData((prev) => ({ ...prev, temperature: decoded }))
-      } else if (uuidMatch(uuid, HUM_CHAR_UUID)) {
-        const decoded = value.getUint16(0, true) / 100
-        console.log('[BLE] Notification received — uuid=', uuid, 'raw=', rawHex, 'decoded humidity=', decoded)
-        setData((prev) => ({ ...prev, humidity: decoded }))
-      }
-    }
-
-    try {
-      console.log('[BLE] Starting notifications for CO2, Temp, Hum')
-      await co2Char.startNotifications()
-      await tempChar.startNotifications()
-      await humChar.startNotifications()
-      console.log('[BLE] Notifications started')
-      co2Char.addEventListener('characteristicvaluechanged', onCharacteristicChanged)
-      tempChar.addEventListener('characteristicvaluechanged', onCharacteristicChanged)
-      humChar.addEventListener('characteristicvaluechanged', onCharacteristicChanged)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to start notifications'
-      console.log('[BLE] Failed to start notifications:', err)
-      setStatus('error')
-      setErrorMessage(message)
-      server.disconnect()
-      return
-    }
-
-    await readAge()
-    ageIntervalRef.current = setInterval(readAge, AGE_POLL_MS)
-    setStatus('connected')
-    console.log('[BLE] Fully connected and listening')
-  }, [])
-
-  return { status, errorMessage, data, connect, disconnect }
+  return { status, errorMessage, data, connect, autoConnect, disconnect }
 }

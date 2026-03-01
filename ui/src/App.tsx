@@ -24,7 +24,7 @@ const statusLabel: Record<BleStatus, string> = {
 }
 
 function App() {
-  const { status, errorMessage, data, connect, disconnect } = useBluetooth()
+  const { status, errorMessage, data, connect, autoConnect, disconnect } = useBluetooth()
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null)
   const [showInstallPrompt, setShowInstallPrompt] = useState(false)
 
@@ -43,6 +43,10 @@ function App() {
       setShowInstallPrompt(false)
     }
   }, [])
+
+  useEffect(() => {
+    autoConnect()
+  }, [autoConnect])
 
   const handleInstallClick = async () => {
     if (!deferredPrompt) return
