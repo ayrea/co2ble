@@ -1,5 +1,9 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 #define SDA 21 // Data
 #define SCL 22 // Clock
@@ -17,9 +21,29 @@
 #define CRC8_POLYNOMIAL 0x31
 #define CRC8_INIT 0xFF
 
+#define ESS_SERVICE_UUID "181A"
+#define CO2_CHAR_UUID "2B8C"
+#define TEMP_CHAR_UUID "2A6E"
+#define HUM_CHAR_UUID "2A6F"
+#define AGE_CHAR_UUID "b5a2e7f0-3c4d-4f5e-8a1b-9c0d1e2f3a4b"
+#define DEVICE_NAME "CO2 Sensor"
+#define READ_INTERVAL 10000
+
 uint16_t temperature;
 uint16_t humidity;
 uint16_t co2;
+
+BLECharacteristic *pCo2Char, *pTempChar, *pHumChar, *pAgeChar;
+unsigned long lastReadMillis = 0;
+
+class AgeReadCallback : public BLECharacteristicCallbacks
+{
+  void onRead(BLECharacteristic *pChar) override
+  {
+    uint32_t age = (uint32_t)(millis() - lastReadMillis);
+    pChar->setValue(age);
+  }
+};
 
 byte Compute_CRC8(const uint8_t *data, uint16_t count, uint16_t offset = 0)
 {
@@ -82,10 +106,40 @@ void setup()
     Serial.println("Setup wire");
   }
   delay(5000);
+
+  BLEDevice::init(DEVICE_NAME);
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(ESS_SERVICE_UUID);
+
+  pCo2Char = pService->createCharacteristic(CO2_CHAR_UUID,
+                                            BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  pTempChar = pService->createCharacteristic(TEMP_CHAR_UUID,
+                                             BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  pHumChar = pService->createCharacteristic(HUM_CHAR_UUID,
+                                            BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  pAgeChar = pService->createCharacteristic(AGE_CHAR_UUID,
+                                            BLECharacteristic::PROPERTY_READ);
+
+  pCo2Char->addDescriptor(new BLE2902());
+  pTempChar->addDescriptor(new BLE2902());
+  pHumChar->addDescriptor(new BLE2902());
+
+  pAgeChar->setCallbacks(new AgeReadCallback());
+
+  pService->start();
+
+  BLEAdvertising *pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID(ESS_SERVICE_UUID);
+  pAdv->setScanResponse(true);
+  BLEDevice::startAdvertising();
 }
 
 void loop()
 {
+  if (lastReadMillis != 0 && (millis() - lastReadMillis) < READ_INTERVAL)
+    return;
+
+  bool validRead = false;
   byte buffer[MEASUREMENT_BYTES];
   size_t received = Wire.requestFrom((uint8_t)SENSOR_I2C_ADDR, (size_t)sizeof(buffer));
 
@@ -103,20 +157,17 @@ void loop()
       buffer[i] = Wire.read();
     }
 
-    // Check CRCs
     if (ValidCRC(buffer))
     {
-      // Get CO2 value
       co2 = buffer[0] * 256 + buffer[1];
 
-      // Get temperature value
       float temp = ((float)buffer[3] * 256.0f + (float)buffer[4]) / SCD4X_RAW_SCALE;
       float temp1 = SCD4X_TEMP_OFFSET + (SCD4X_TEMP_SCALE * temp);
       temperature = (uint16_t)(temp1 * 100.0f);
 
-      // Get humidity value
       float hum = (((float)buffer[6] * 256.0f + (float)buffer[7]) / SCD4X_RAW_SCALE) * SCD4X_HUM_SCALE;
       humidity = (uint16_t)(hum * 100.0f);
+      validRead = true;
     }
     else
     {
@@ -124,6 +175,17 @@ void loop()
       temperature = 0;
       humidity = 0;
     }
+  }
+
+  if (validRead)
+  {
+    lastReadMillis = millis();
+    pCo2Char->setValue(co2);
+    pTempChar->setValue(temperature);
+    pHumChar->setValue(humidity);
+    pCo2Char->notify();
+    pTempChar->notify();
+    pHumChar->notify();
   }
 
   Serial.print("CO2: ");
@@ -138,5 +200,4 @@ void loop()
   Serial.println(String(fhum, 0));
 
   Serial.println("Waiting 10s before the next round...");
-  delay(10000);
 }
