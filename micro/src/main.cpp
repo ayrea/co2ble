@@ -33,8 +33,12 @@ uint16_t temperature;
 uint16_t humidity;
 uint16_t co2;
 
+BLEServer *pServer = nullptr;
 BLECharacteristic *pCo2Char, *pTempChar, *pHumChar, *pAgeChar;
 unsigned long lastReadMillis = 0;
+
+volatile bool deviceConnected = false;
+bool oldDeviceConnected = false;
 
 class AgeReadCallback : public BLECharacteristicCallbacks
 {
@@ -49,6 +53,7 @@ class ServerCallbacks : public BLEServerCallbacks
 {
   void onConnect(BLEServer *pServer, esp_ble_gatts_cb_param_t *param) override
   {
+    deviceConnected = true;
     Serial.print("[BLE] Client connected: ");
     if (param && param->connect.remote_bda)
     {
@@ -67,8 +72,8 @@ class ServerCallbacks : public BLEServerCallbacks
   }
   void onDisconnect(BLEServer *pServer) override
   {
-    Serial.println("[BLE] Client disconnected — restarting advertising");
-    BLEDevice::startAdvertising();
+    deviceConnected = false;
+    Serial.println("[BLE] Client disconnected");
   }
 };
 
@@ -139,7 +144,7 @@ void setup()
   BLEDevice::init(DEVICE_NAME);
   Serial.println("[BLE] Device name set: CO2 Sensor");
 
-  BLEServer *pServer = BLEDevice::createServer();
+  pServer = BLEDevice::createServer();
   Serial.println("[BLE] Server created");
   pServer->setCallbacks(new ServerCallbacks());
 
@@ -177,6 +182,19 @@ void setup()
 
 void loop()
 {
+  // Reconnection handling — runs every loop iteration before the 10-s sensor guard
+  if (!deviceConnected && oldDeviceConnected)
+  {
+    delay(500); // let BLE stack fully settle
+    pServer->startAdvertising();
+    Serial.println("[BLE] Advertising restarted — ready for reconnection");
+    oldDeviceConnected = false;
+  }
+  if (deviceConnected && !oldDeviceConnected)
+  {
+    oldDeviceConnected = true;
+  }
+
   if (lastReadMillis != 0)
   {
     unsigned long elapsed = millis() - lastReadMillis;
@@ -251,10 +269,13 @@ void loop()
     pCo2Char->setValue(co2);
     pTempChar->setValue(temperature);
     pHumChar->setValue(humidity);
-    pCo2Char->notify();
-    pTempChar->notify();
-    pHumChar->notify();
-    Serial.println("[BLE] Notifications sent for CO2/Temp/Hum");
+    if (deviceConnected)
+    {
+      pCo2Char->notify();
+      pTempChar->notify();
+      pHumChar->notify();
+      Serial.println("[BLE] Notifications sent for CO2/Temp/Hum");
+    }
   }
 
   Serial.print("[SENSOR] CO2: ");
